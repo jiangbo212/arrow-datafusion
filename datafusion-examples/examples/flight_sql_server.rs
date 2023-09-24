@@ -17,6 +17,7 @@
 
 use arrow::ipc::writer::IpcWriteOptions;
 use arrow::record_batch::RecordBatch;
+use arrow::error::ArrowError::SchemaError;
 use arrow_flight::encode::FlightDataEncoderBuilder;
 use arrow_flight::flight_descriptor::DescriptorType;
 use arrow_flight::flight_service_server::{FlightService, FlightServiceServer};
@@ -49,6 +50,7 @@ use mimalloc::MiMalloc;
 use prost::Message;
 use std::pin::Pin;
 use std::sync::Arc;
+use arrow_flight::sql::metadata::{GetCatalogsBuilder, GetDbSchemasBuilder, GetTablesBuilder};
 use tonic::metadata::MetadataValue;
 use tonic::transport::Server;
 use tonic::{Request, Response, Status, Streaming};
@@ -337,28 +339,232 @@ impl FlightSqlService for FlightSqlServiceImpl {
     async fn get_flight_info_catalogs(
         &self,
         _query: CommandGetCatalogs,
-        _request: Request<FlightDescriptor>,
+        request: Request<FlightDescriptor>,
     ) -> Result<Response<FlightInfo>, Status> {
         info!("get_flight_info_catalogs");
-        Err(Status::unimplemented("Implement get_flight_info_catalogs"))
+        let handle = Uuid::new_v4().hyphenated().to_string();
+
+        let ctx = self.get_ctx(&request)?;
+
+        let mut builder = GetCatalogsBuilder::new();
+
+        let catalog_names = &ctx.catalog_names();
+        for catalog_name in catalog_names {
+            let _ = builder.append(catalog_name);
+        }
+
+        let result = vec![builder.build()?];
+
+        // if we get an empty result, create an empty schema
+        let schema = match result.get(0) {
+            None => Schema::empty(),
+            Some(batch) => (*batch.schema()).clone(),
+        };
+
+        self.results.insert(handle.to_string(), result);
+
+        // if we had multiple endpoints to connect to, we could use this Location
+        // but in the case of standalone DataFusion, we don't
+        // let loc = Location {
+        //     uri: "grpc+tcp://127.0.0.1:50051".to_string(),
+        // };
+        let fetch = FetchResults {
+            handle: handle.to_string(),
+        };
+        let buf = fetch.as_any().encode_to_vec().into();
+        let ticket = Ticket { ticket: buf };
+        let endpoint = FlightEndpoint {
+            ticket: Some(ticket),
+            location: vec![],
+        };
+        let endpoints = vec![endpoint];
+
+        let message = SchemaAsIpc::new(&schema, &IpcWriteOptions::default())
+            .try_into()
+            .map_err(|e| status!("Unable to serialize schema", e))?;
+        let IpcMessage(schema_bytes) = message;
+
+        let flight_desc = FlightDescriptor {
+            r#type: DescriptorType::Cmd.into(),
+            cmd: Default::default(),
+            path: vec![],
+        };
+        // send -1 for total_records and total_bytes instead of iterating over all the
+        // batches to get num_rows() and total byte size.
+        let info = FlightInfo {
+            schema: schema_bytes,
+            flight_descriptor: Some(flight_desc),
+            endpoint: endpoints,
+            total_records: -1_i64,
+            total_bytes: -1_i64,
+            ordered: false,
+        };
+        let resp = Response::new(info);
+        Ok(resp)
     }
 
     async fn get_flight_info_schemas(
         &self,
         _query: CommandGetDbSchemas,
-        _request: Request<FlightDescriptor>,
+        request: Request<FlightDescriptor>,
     ) -> Result<Response<FlightInfo>, Status> {
         info!("get_flight_info_schemas");
-        Err(Status::unimplemented("Implement get_flight_info_schemas"))
+        let handle = Uuid::new_v4().hyphenated().to_string();
+
+        let ctx = self.get_ctx(&request)?;
+
+        let mut builder = GetDbSchemasBuilder::new(None::<String>, None::<String>);
+
+        let catalog_names = &ctx.catalog_names();
+        for catalog_name in catalog_names {
+            let catalogs = &ctx.catalog(catalog_name);
+            let catalog = match catalogs {
+                Some(catalog) => catalog,
+                None => return Err(status!("not found catalog", SchemaError("not found catalog".to_string())))
+            };
+            let schema_names = &catalog.schema_names();
+            for schema_name in schema_names {
+                let _ = builder.append(catalog_name, schema_name);
+            }
+        }
+
+        let result = vec![builder.build()?];
+
+        // if we get an empty result, create an empty schema
+        let schema = match result.get(0) {
+            None => Schema::empty(),
+            Some(batch) => (*batch.schema()).clone(),
+        };
+
+        self.results.insert(handle.to_string(), result);
+
+        // if we had multiple endpoints to connect to, we could use this Location
+        // but in the case of standalone DataFusion, we don't
+        // let loc = Location {
+        //     uri: "grpc+tcp://127.0.0.1:50051".to_string(),
+        // };
+        let fetch = FetchResults {
+            handle: handle.to_string(),
+        };
+        let buf = fetch.as_any().encode_to_vec().into();
+        let ticket = Ticket { ticket: buf };
+        let endpoint = FlightEndpoint {
+            ticket: Some(ticket),
+            location: vec![],
+        };
+        let endpoints = vec![endpoint];
+
+        let message = SchemaAsIpc::new(&schema, &IpcWriteOptions::default())
+            .try_into()
+            .map_err(|e| status!("Unable to serialize schema", e))?;
+        let IpcMessage(schema_bytes) = message;
+
+        let flight_desc = FlightDescriptor {
+            r#type: DescriptorType::Cmd.into(),
+            cmd: Default::default(),
+            path: vec![],
+        };
+        // send -1 for total_records and total_bytes instead of iterating over all the
+        // batches to get num_rows() and total byte size.
+        let info = FlightInfo {
+            schema: schema_bytes,
+            flight_descriptor: Some(flight_desc),
+            endpoint: endpoints,
+            total_records: -1_i64,
+            total_bytes: -1_i64,
+            ordered: false,
+        };
+        let resp = Response::new(info);
+        Ok(resp)
     }
 
     async fn get_flight_info_tables(
         &self,
-        _query: CommandGetTables,
-        _request: Request<FlightDescriptor>,
+        query: CommandGetTables,
+        request: Request<FlightDescriptor>,
     ) -> Result<Response<FlightInfo>, Status> {
-        info!("get_flight_info_tables");
-        Err(Status::unimplemented("Implement get_flight_info_tables"))
+        info!("get_flight_info_tables, query:{:?}", &query.catalog);
+        let handle = Uuid::new_v4().hyphenated().to_string();
+
+        let ctx = self.get_ctx(&request)?;
+
+        let mut builder = GetTablesBuilder::new(
+            None::<String>,
+            None::<String>,
+            None::<String>,
+            None::<String>,
+            false,
+        );
+
+        let catalog_names = &ctx.catalog_names();
+        for catalog_name in catalog_names {
+            let catalogs = &ctx.catalog(catalog_name);
+            let catalog = match catalogs {
+                Some(catalog) => catalog,
+                None => return Err(status!("not found catalog", SchemaError("not found catalog".to_string())))
+            };
+            let schema_names = &catalog.schema_names();
+            for schema_name in schema_names {
+                let schemas = &catalog.schema(schema_name);
+                let schema = match schemas {
+                    Some(schema) => schema,
+                    None => return Err(status!("not fund schema", SchemaError("not found scheam".to_string())))
+                };
+                let table_names = &schema.table_names();
+                for table_name in table_names {
+                    let _ = &builder.append(catalog_name, &schema_name, &table_name, "TABLE", &Schema::empty());
+                }
+            }
+        }
+
+        let result = vec![builder.build()?];
+
+        // if we get an empty result, create an empty schema
+        let schema = match result.get(0) {
+            None => Schema::empty(),
+            Some(batch) => (*batch.schema()).clone(),
+        };
+
+        self.results.insert(handle.to_string(), result);
+
+        // if we had multiple endpoints to connect to, we could use this Location
+        // but in the case of standalone DataFusion, we don't
+        // let loc = Location {
+        //     uri: "grpc+tcp://127.0.0.1:50051".to_string(),
+        // };
+        let fetch = FetchResults {
+            handle: handle.to_string(),
+        };
+        let buf = fetch.as_any().encode_to_vec().into();
+        let ticket = Ticket { ticket: buf };
+        let endpoint = FlightEndpoint {
+            ticket: Some(ticket),
+            location: vec![],
+        };
+        let endpoints = vec![endpoint];
+
+        let message = SchemaAsIpc::new(&schema, &IpcWriteOptions::default())
+            .try_into()
+            .map_err(|e| status!("Unable to serialize schema", e))?;
+        let IpcMessage(schema_bytes) = message;
+
+        let flight_desc = FlightDescriptor {
+            r#type: DescriptorType::Cmd.into(),
+            cmd: Default::default(),
+            path: vec![],
+        };
+        // send -1 for total_records and total_bytes instead of iterating over all the
+        // batches to get num_rows() and total byte size.
+        let info = FlightInfo {
+            schema: schema_bytes,
+            flight_descriptor: Some(flight_desc),
+            endpoint: endpoints,
+            total_records: -1_i64,
+            total_bytes: -1_i64,
+            ordered: false,
+        };
+        let resp = Response::new(info);
+        Ok(resp)
     }
 
     async fn get_flight_info_table_types(
@@ -374,10 +580,13 @@ impl FlightSqlService for FlightSqlServiceImpl {
 
     async fn get_flight_info_sql_info(
         &self,
-        _query: CommandGetSqlInfo,
-        _request: Request<FlightDescriptor>,
+        query: CommandGetSqlInfo,
+        request: Request<FlightDescriptor>,
     ) -> Result<Response<FlightInfo>, Status> {
-        info!("get_flight_info_sql_info");
+        let flight_descriptor = &request.into_inner();
+        let cmd = String::from_utf8(flight_descriptor.cmd.to_vec())
+            .map_err(|e|status!("cmd fail", e))?;
+        info!("get_flight_info_sql_info, query:{:?}, cmd:{}, path:{:?}", &query.info, cmd, flight_descriptor.path);
         Err(Status::unimplemented("Implement CommandGetSqlInfo"))
     }
 
@@ -694,7 +903,9 @@ impl FlightSqlService for FlightSqlServiceImpl {
         Err(Status::unimplemented("Implement do_action_cancel_query"))
     }
 
-    async fn register_sql_info(&self, _id: i32, _result: &SqlInfo) {}
+    async fn register_sql_info(&self, id: i32, result: &SqlInfo) {
+        info!("register sql info, id:{}, result:{:?}", id, result)
+    }
 }
 
 #[derive(Clone, PartialEq, ::prost::Message)]

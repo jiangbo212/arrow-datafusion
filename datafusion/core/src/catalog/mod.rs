@@ -242,7 +242,7 @@ mod tests {
     }
 
     #[test]
-    fn memory_catalog_dereg_nonempty_schema() {
+    fn memory_catalog_degree_nonempty_schema() {
         let cat = Arc::new(MemoryCatalogProvider::new()) as Arc<dyn CatalogProvider>;
 
         let schema = Arc::new(MemorySchemaProvider::new()) as Arc<dyn SchemaProvider>;
